@@ -92,6 +92,8 @@ class Library:
     """
 
     def __init__(self, ns, kind, dispatch_key=""):
+        from torch.fx.operator_schemas import _SCHEMA_TO_SIGNATURE_CACHE
+
         if kind not in ("IMPL", "DEF", "FRAGMENT"):
             raise ValueError("Unsupported kind: ", kind)
 
@@ -100,9 +102,6 @@ class Library:
                 ns,
                 " is a reserved namespace. Please try creating a library with another name.",
             )
-        if torch._running_with_deploy():
-            _library.utils.warn_deploy()
-            return
 
         frame = traceback.extract_stack(limit=3)[0]
         filename, lineno = frame.filename, frame.lineno
@@ -128,6 +127,7 @@ class Library:
             self._op_defs,
             self._registration_handles,
             self.m,
+            _SCHEMA_TO_SIGNATURE_CACHE,
         )
 
     def __repr__(self):
@@ -149,12 +149,10 @@ class Library:
             name of the operator as inferred from the schema.
 
         Example::
+
             >>> my_lib = Library("mylib", "DEF")
             >>> my_lib.define("sum(Tensor self) -> Tensor")
         """
-        if torch._running_with_deploy():
-            _library.utils.warn_deploy()
-            return
 
         # This is added because we also want to disallow PURE_FUNCTION alias analysis which is a valid
         # AliasAnalysis type in C++
@@ -187,9 +185,6 @@ class Library:
 
     def _register_fake(self, op_name, fn, _stacklevel=1, *, allow_override=False):
         r"""Registers the fake impl for an operator defined in the library."""
-        if torch._running_with_deploy():
-            _library.utils.warn_deploy()
-            return
 
         source = torch._library.utils.get_source(_stacklevel + 1)
         frame = sys._getframe(_stacklevel)
@@ -233,9 +228,6 @@ class Library:
         If it is a TorchDispatchMode, we expect fn to have the following signature:
         (mode, func: OpOverload, types: Tuple[type, ...], args, kwargs) -> Any
         """
-        if torch._running_with_deploy():
-            _library.utils.warn_deploy()
-            return
 
         qualname = f"{self.ns}::{op_name}"
         entry = torch._library.simple_registry.singleton.find(qualname)
@@ -251,12 +243,10 @@ class Library:
                           the dispatch key that the library was created with.
 
         Example::
+
             >>> my_lib = Library("aten", "IMPL")
             >>> my_lib._impl_with_aoti_compile("div.Tensor", "CPU")
         """
-        if torch._running_with_deploy():
-            _library.utils.warn_deploy()
-            return
 
         if dispatch_key == "":
             dispatch_key = self.dispatch_key
@@ -313,14 +303,12 @@ class Library:
                          registered.
 
         Example::
+
             >>> my_lib = Library("aten", "IMPL")
             >>> def div_cpu(self, other):
             >>>     return self * (1 / other)
             >>> my_lib.impl("div.Tensor", div_cpu, "CPU")
         """
-        if torch._running_with_deploy():
-            _library.utils.warn_deploy()
-            return
 
         if not callable(fn):
             raise TypeError(
@@ -396,22 +384,20 @@ class Library:
                          to :attr:`fn` when calling. This should be used to create the appropriate keyset for redispatch calls.
 
         Example::
+
             >>> my_lib = Library("_", "IMPL")
             >>> def fallback_kernel(op, *args, **kwargs):
             >>>     # Handle all autocast ops generically
             >>>     # ...
             >>> my_lib.fallback(fallback_kernel, "Autocast")
         """
-        if torch._running_with_deploy():
-            _library.utils.warn_deploy()
-            return
 
         if dispatch_key == "":
             dispatch_key = self.dispatch_key
 
         if self.ns != "_":
             raise RuntimeError(
-                f"""Fallback can only be registered using libary fragment on the global namespace "_" but it is {self.ns}"""
+                f"""Fallback can only be registered using library fragment on the global namespace "_" but it is {self.ns}"""
             )
 
         assert dispatch_key != ""
@@ -453,9 +439,8 @@ def _del_library(
     op_defs,
     registration_handles,
     m,
+    schema_to_signature_cache,
 ):
-    import torch.fx
-
     for op_def in op_defs:
         name = op_def
         overload_name = ""
@@ -464,10 +449,8 @@ def _del_library(
         if (
             name,
             overload_name,
-        ) in torch.fx.operator_schemas._SCHEMA_TO_SIGNATURE_CACHE:
-            del torch.fx.operator_schemas._SCHEMA_TO_SIGNATURE_CACHE[
-                (name, overload_name)
-            ]
+        ) in schema_to_signature_cache:
+            del schema_to_signature_cache[(name, overload_name)]
 
     captured_impls -= op_impls
     captured_defs -= op_defs
@@ -923,13 +906,27 @@ def register_autocast(
         lib = Library(namespace, "FRAGMENT")
         _keep_alive.append(lib)
 
-    def kernel(_, *args, **kwargs):
+    def _maybe_override_py_impl(op: torch._ops.OpOverload, dispatch_key):
+        def inner(kernel):
+            if op.has_kernel_for_dispatch_key(dispatch_key):
+                op.py_kernels.pop(dispatch_key)
+            return op.py_impl(dispatch_key)(kernel)
+
+        return inner
+
+    @_maybe_override_py_impl(_op, torch._C.DispatchKey.AutocastCPU)
+    @_maybe_override_py_impl(_op, torch._C.DispatchKey.AutocastCUDA)
+    def _autocast_py_impl(*args, **kwargs):
         assert len(kwargs) == 0, "Custom ops do not support kwargs yet."
         autocast_keyset = torch._C.DispatchKeySet(
             torch._C.DispatchKey.AutocastCPU
         ) | torch._C.DispatchKeySet(torch._C.DispatchKey.AutocastCUDA)
         with torch._C._ExcludeDispatchKeyGuard(autocast_keyset):
             return _op(*_cast(args, device_type, cast_inputs))
+
+    def kernel(_, *args, **kwargs):
+        assert len(kwargs) == 0, "Custom ops do not support kwargs yet."
+        return _autocast_py_impl(*args, **kwargs)
 
     if device_type == "cuda":
         return lib.impl(opname, kernel, "AutocastCUDA", with_keyset=True)

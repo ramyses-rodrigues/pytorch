@@ -9,7 +9,8 @@ from contextlib import AbstractContextManager, nullcontext
 from typing import Any, Callable, Literal, Optional, TYPE_CHECKING
 
 import torch.fx
-from torch._dynamo.utils import detect_fake_mode, dynamo_timed
+from torch._dynamo.utils import dynamo_timed
+from torch._inductor.cpp_builder import normalize_path_separator
 from torch._inductor.cudagraph_utils import BoxedDeviceIndex
 from torch._inductor.runtime.cache_dir_utils import temporary_cache_dir
 from torch._inductor.utils import BoxedBool, InputType
@@ -74,14 +75,14 @@ class CompiledArtifact:
             key = cache_info.aot_autograd_artifacts[0]
 
             if format == "binary":
-                # cant assert that it is a file since it might not exist yet
+                # can't assert that it is a file since it might not exist yet
                 assert not os.path.isdir(path)
 
                 from torch.utils._appending_byte_serializer import BytesWriter
 
                 from .codecache import torch_key
 
-                writer = BytesWriter(0)
+                writer = BytesWriter()
                 writer.write_bytes(torch_key())
                 writer.write_str(key)
                 writer.write_bytes(artifact_bytes)
@@ -116,9 +117,10 @@ class CompiledArtifact:
     def load(
         *, path: str, format: Literal["binary", "unpacked"] = "binary"
     ) -> CompiledArtifact:
+        path = normalize_path_separator(path)
         with dynamo_timed("CompiledArtifact.load"):
             if format == "binary":
-                # cant assert that it is a file since it might not exist yet
+                # can't assert that it is a file since it might not exist yet
                 assert not os.path.isdir(path)
                 with open(path, "rb") as file:
                     artifacts = file.read()
@@ -155,7 +157,12 @@ class CompiledArtifact:
                     )
 
                     entry = AOTAutogradCache._lookup(
-                        key, local=True, remote=False, args=[]
+                        key,
+                        local=True,
+                        remote=False,
+                        args=[],
+                        cache_info={},
+                        aot_config=None,
                     )
 
                 assert entry is not None
@@ -178,29 +185,80 @@ class CompiledArtifact:
 
 
 def standalone_compile(
-    gm: GraphModule, example_inputs: Sequence[InputType], **kwargs: Any
+    gm: GraphModule,
+    example_inputs: Sequence[InputType],
+    *,
+    dynamic_shapes: Any,
+    options: Any,
 ) -> CompiledArtifact:
     from torch.compiler._cache import CacheArtifactManager
 
     from .compile_fx import compile_fx
 
-    fake_mode = detect_fake_mode(example_inputs)
-    if fake_mode is None:
+    ignore_shape_env = False
+    if dynamic_shapes == "from_example_inputs":
         fake_mode = FakeTensorMode(shape_env=ShapeEnv())
+        # tells compile_fx to ignore the shape_envs on the ambient context
+        # and the graph_module.
+        ignore_shape_env = True
+    elif dynamic_shapes == "from_tracing_context":
+        # Reuse fake_mode from the TracingContext.
+        # NB: The TracingContext only exists if we're currently in a torch.compile backend.
+        context = torch._guards.TracingContext.get()
+        assert context.fake_mode is not None
+        fake_mode = context.fake_mode
+    elif dynamic_shapes == "from_graph":
+        fake_mode = FakeTensorMode(shape_env=ShapeEnv())
+        # Strategy: find a FakeTensor in the graph output, grab its FakeTensorMode.
+        # The graph passed to standalone_compile must be an Inductor-approved graph,
+        # which means that there is at least one Tensor output and the output node
+        # contains a flat list of Tensors.
+        last_node = next(iter(reversed(gm.graph.nodes)))
+        assert last_node.op == "output"
+        assert len(last_node.args) == 1
+
+        def handle_node(node: torch.fx.Node) -> None:
+            nonlocal fake_mode
+            if "example_value" in node.meta:
+                maybe_tensor = node.meta["example_value"]
+                if isinstance(maybe_tensor, torch._subclasses.fake_tensor.FakeTensor):
+                    fake_mode = maybe_tensor.fake_mode
+
+        # If gm came from Dynamo, then last_node.args[0] is always a list,
+        # even in single-Tensor returns.
+        #
+        # It's possible to get into a situation where last_node.args[0]
+        # is a Node (and not a list!). This happens if you call split_module
+        # on the graph. We allow for this case since it is common.
+        if isinstance(last_node.args[0], torch.fx.Node):
+            handle_node(last_node.args[0])
+        else:
+            for node in last_node.args[0]:
+                handle_node(node)
+
+    else:
+        raise ValueError(
+            f"standalone_compile got unsupported `dynamic_shapes` value: dynamic_shapes={dynamic_shapes}."
+        )
 
     context = torch._guards.TracingContext(fake_mode)
-    with torch._guards.tracing(context):
-        with CacheArtifactManager.with_fresh_cache():
-            # compile_fx can mutate gm
-            gm = copy.deepcopy(gm)
-            compiled_fn = compile_fx(gm, example_inputs, **kwargs)
-            assert callable(compiled_fn)
+    with (
+        torch._guards.tracing(context),
+        CacheArtifactManager.with_fresh_cache(),
+        config.patch("triton.autotune_at_compile_time", True),
+    ):
+        # compile_fx can mutate gm
+        gm = copy.deepcopy(gm)
+        compiled_fn = compile_fx(
+            gm, example_inputs, ignore_shape_env=ignore_shape_env, **options
+        )
+        assert callable(compiled_fn)
 
-            artifacts = torch.compiler.save_cache_artifacts()
-            if artifacts is None:
-                log.warning(
-                    "standalone_compile artifact generation failed, cannot save. "
-                    "Run with TORCH_LOGS=+torch._inductor.codecache to identify the problem"
-                )
+        artifacts = torch.compiler.save_cache_artifacts()
+        if artifacts is None:
+            log.warning(
+                "standalone_compile artifact generation failed, cannot save. "
+                "Run with TORCH_LOGS=+torch._inductor.codecache to identify the problem"
+            )
 
     return CompiledArtifact(compiled_fn, artifacts)
