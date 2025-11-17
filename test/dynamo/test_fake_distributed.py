@@ -13,7 +13,7 @@ if dist.is_available():
         all_to_all_single_autograd,
         wait_tensor,
     )
-    from torch.testing._internal.distributed.fake_pg import FakeStore
+    from torch.distributed.device_mesh import init_device_mesh
 
 
 def normalize_graph(gm):
@@ -24,8 +24,9 @@ def normalize_graph(gm):
 class TestFakeDistributed(DynamoTestCase):
     def setUp(self):
         # Use FakeProcessGroup to run tests on a single process
-        self.store = FakeStore()
-        dist.init_process_group(backend="fake", rank=0, world_size=2, store=self.store)
+        dist.init_process_group(backend="fake", rank=0, world_size=2)
+        self.local_rank = 0
+        self.world_size = 2
 
     def tearDown(self):
         dist.destroy_process_group()
@@ -89,12 +90,12 @@ class GraphModule(torch.nn.Module):
             """\
 class GraphModule(torch.nn.Module):
     def forward(self, primals_1: "Sym(u0)", primals_2: "Sym(u1)", primals_3: "Sym(u2)", primals_4: "f32[u0, u1, u2]"):
-        ge_1: "Sym(u0 >= 0)" = primals_1 >= 0
-        _assert_scalar = torch.ops.aten._assert_scalar.default(ge_1, "Runtime assertion failed for expression u0 >= 0 on node 'ge'");  ge_1 = _assert_scalar = None
-        ge_3: "Sym(u1 >= 0)" = primals_2 >= 0
-        _assert_scalar_1 = torch.ops.aten._assert_scalar.default(ge_3, "Runtime assertion failed for expression u1 >= 0 on node 'ge_1'");  ge_3 = _assert_scalar_1 = None
-        ge_5: "Sym(u2 >= 0)" = primals_3 >= 0
-        _assert_scalar_2 = torch.ops.aten._assert_scalar.default(ge_5, "Runtime assertion failed for expression u2 >= 0 on node 'ge_2'");  ge_5 = _assert_scalar_2 = None
+        ge: "Sym(u0 >= 0)" = primals_1 >= 0
+        _assert_scalar = torch.ops.aten._assert_scalar.default(ge, "Runtime assertion failed for expression u0 >= 0 on node 'ge'");  ge = _assert_scalar = None
+        ge_1: "Sym(u1 >= 0)" = primals_2 >= 0
+        _assert_scalar_1 = torch.ops.aten._assert_scalar.default(ge_1, "Runtime assertion failed for expression u1 >= 0 on node 'ge_1'");  ge_1 = _assert_scalar_1 = None
+        ge_2: "Sym(u2 >= 0)" = primals_3 >= 0
+        _assert_scalar_2 = torch.ops.aten._assert_scalar.default(ge_2, "Runtime assertion failed for expression u2 >= 0 on node 'ge_2'");  ge_2 = _assert_scalar_2 = None
 
         floordiv: "Sym((u0//2))" = primals_1 // 2
 
@@ -114,6 +115,25 @@ class GraphModule(torch.nn.Module):
         return (None, None, None, wait_tensor_1)
 """,  # noqa: B950
         )
+
+    def test_device_mesh_get_local_rank(self):
+        device_mesh = init_device_mesh(
+            device_type="cpu",
+            mesh_shape=(self.world_size,),
+            mesh_dim_names=("dp",),  # data parallel dimension
+        )
+
+        @torch.compile(backend="eager", fullgraph=True)
+        def fn(x):
+            local_rank = device_mesh.get_local_rank()
+            global_rank = device_mesh.get_rank()
+            if "dp" not in device_mesh.mesh_dim_names:
+                x = x * 2
+            return x + local_rank + global_rank
+
+        x = torch.ones(10)
+        res = fn(x)
+        self.assertEqual(res, x)
 
 
 instantiate_parametrized_tests(TestFakeDistributed)
